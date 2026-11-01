@@ -29,7 +29,6 @@ SITE_HOME = "https://rivernexus.vip/"
 WELFARE_URL = "https://rivernexus.vip/welfare"
 LOGIN_API = "/api/user/login"
 CHECKIN_API = "/api/user/checkin"
-PROXY_URL = "http://127.0.0.1:10808"
 API_TIMEOUT_SECONDS = 8
 MAX_GUI_LOG_LINES = 3000
 QUOTA_UNITS_PER_USD = Decimal("500000")
@@ -189,7 +188,15 @@ class SignError(RuntimeError):
 
 
 class NetworkError(SignError):
-    """????????????????????"""
+    """?????????????????"""
+
+
+class HttpStatusError(SignError):
+    """HTTP ????????"""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
 
 def request_json(opener: Any, path: str, method: str, payload: dict[str, Any] | None,
                  token: str = "", cancel: threading.Event | None = None) -> dict[str, Any]:
@@ -221,7 +228,7 @@ def request_json(opener: Any, path: str, method: str, payload: dict[str, Any] | 
         message = body_data.get("message") or nested.get("message") or text[:300] or f"HTTP {exc.code}"
         if exc.code in (401, 403):
             raise SignError(f"\u8d26\u53f7\u6216\u5bc6\u7801\u9519\u8bef\uff0c\u6216\u767b\u5f55\u5df2\u5931\u6548\uff08HTTP {exc.code}\uff09\uff1a{message}") from exc
-        raise SignError(f"\u670d\u52a1\u5668\u9519\u8bef\uff08HTTP {exc.code}\uff09\uff1a{message}") from exc
+        raise HttpStatusError(exc.code, f"\u670d\u52a1\u5668\u9519\u8bef\uff08HTTP {exc.code}\uff09\uff1a{message}") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         reason = getattr(exc, "reason", None) or str(exc)
         raise NetworkError(f"\u7f51\u7edc\u8fde\u63a5\u5931\u8d25\uff1a{reason}") from exc
@@ -237,16 +244,32 @@ def request_json(opener: Any, path: str, method: str, payload: dict[str, Any] | 
     return data
 
 
-def request_with_fallback(direct_opener: Any, proxy_opener: Any, path: str, method: str,
+def request_with_fallback(direct_opener: Any, proxy_opener: Any | None, path: str, method: str,
                           payload: dict[str, Any] | None, token: str,
-                          cancel: threading.Event, logger: logging.Logger) -> dict[str, Any]:
+                          cancel: threading.Event, logger: logging.Logger,
+                          retry_login_conflict_via_proxy: bool = False) -> dict[str, Any]:
     """\u4f18\u5148\u76f4\u8fde\uff1b\u76f4\u8fde\u7f51\u7edc\u5931\u8d25\u540e\u8bb0\u5f55\u9519\u8bef\u5e76\u5207\u6362\u672c\u5730\u4ee3\u7406\u3002"""
     try:
-        logger.info("\u63a5\u53e3\u8bf7\u6c42\u4f18\u5148\u4f7f\u7528\u76f4\u8fde\uff1a%s %s", method, path)
+        logger.info("\u63a5\u53e3\u8bf7\u6c42\u4f18\u5148\u4f7f\u7528\u76f4\u8fde\uff08\u4e0d\u7ecf\u4ee3\u7406\uff09\uff1a%s %s", method, path)
         return request_json(direct_opener, path, method, payload, token, cancel)
+    except HttpStatusError as direct_error:
+        if (direct_error.status != 409 or not retry_login_conflict_via_proxy
+                or path != LOGIN_API or method != "POST"):
+            raise
+        if proxy_opener is None:
+            raise SignError(f"{direct_error}\uff1b\u672a\u68c0\u6d4b\u5230\u53ef\u7528\u7684\u7cfb\u7edf\u4ee3\u7406\uff0c\u65e0\u6cd5\u5207\u6362\u7f51\u7edc\u8def\u7531") from direct_error
+        logger.warning("\u76f4\u8fde\u767b\u5f55\u8fd4\u56de HTTP 409\uff0c\u6539\u4f7f\u7528\u7cfb\u7edf\u4ee3\u7406\u91cd\u8bd5\u767b\u5f55")
+        try:
+            result = request_json(proxy_opener, path, method, payload, token, cancel)
+            logger.info("\u7cfb\u7edf\u4ee3\u7406\u767b\u5f55\u8bf7\u6c42\u6210\u529f")
+            return result
+        except (NetworkError, HttpStatusError) as proxy_error:
+            raise SignError(f"\u76f4\u8fde\u767b\u5f55\u8fd4\u56de HTTP 409\uff1b\u4f7f\u7528\u7cfb\u7edf\u4ee3\u7406\u91cd\u8bd5\u4ecd\u5931\u8d25\uff1a{proxy_error}") from proxy_error
     except NetworkError as direct_error:
         logger.error("\u76f4\u8fde\u8bf7\u6c42\u5931\u8d25\uff1a%s", direct_error)
-        logger.info("\u5f00\u59cb\u4f7f\u7528\u672c\u5730\u4ee3\u7406 %s \u91cd\u8bd5\uff1a%s %s", PROXY_URL, method, path)
+        if proxy_opener is None:
+            raise NetworkError(f"{direct_error}\uff1b\u672a\u68c0\u6d4b\u5230\u53ef\u7528\u7684\u7cfb\u7edf\u4ee3\u7406") from direct_error
+        logger.info("\u5f00\u59cb\u4f7f\u7528\u7cfb\u7edf\u4ee3\u7406\u91cd\u8bd5\uff1a%s %s", method, path)
         try:
             result = request_json(proxy_opener, path, method, payload, token, cancel)
             logger.info("\u672c\u5730\u4ee3\u7406\u8bf7\u6c42\u6210\u529f\uff1a%s %s", method, path)
@@ -267,7 +290,7 @@ def walk_dicts(obj: Any):
 
 
 def field_value(data: Any, keys: tuple[str, ...], labels: tuple[str, ...]) -> str:
-    """??????????????????????"""
+    """???????????????????"""
     normalized = {key.casefold() for key in keys}
     for item in walk_dicts(data):
         for key, value in item.items():
@@ -336,7 +359,7 @@ def extract_reward(data: Any, text: str) -> str:
 
 
 def parse_welfare_stats(data: Any) -> dict[str, str]:
-    """???????????????????????????"""
+    """????????????????????????"""
     stats = find_stats_object(data)
     total_checkins = stats.get("total_checkins", stats.get("checkin_count", "?"))
     total_quota = stats.get("total_quota")
@@ -364,14 +387,28 @@ def parse_welfare_stats(data: Any) -> dict[str, str]:
 def sign_once(username: str, password: str, cancel: threading.Event, logger: logging.Logger) -> dict[str, Any]:
     """???????????????? POST ???????"""
     cookie_jar = http.cookiejar.CookieJar()
-    direct_opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
-    proxy_handler = urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL})
-    proxy_opener = urllib.request.build_opener(proxy_handler, urllib.request.HTTPCookieProcessor(cookie_jar))
+    # Force the first attempt to bypass both environment and Windows system proxies.
+    direct_opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPCookieProcessor(cookie_jar),
+    )
+    # Discover environment/Windows proxy settings instead of assuming a fixed port.
+    system_proxies = urllib.request.getproxies()
+    usable_proxies = {scheme: value for scheme, value in system_proxies.items()
+                      if scheme in {"http", "https"} and value}
+    proxy_opener = (
+        urllib.request.build_opener(
+            urllib.request.ProxyHandler(usable_proxies),
+            urllib.request.HTTPCookieProcessor(cookie_jar),
+        )
+        if usable_proxies else None
+    )
 
     logger.info("\u6b63\u5728\u767b\u5f55 %s", "https://rivernexus.vip/sign-in")
     login = request_with_fallback(
         direct_opener, proxy_opener, LOGIN_API, "POST",
         {"username": username, "password": password}, "", cancel, logger,
+        retry_login_conflict_via_proxy=True,
     )
     if login.get("success") is not True:
         message = login.get("message") or login.get("error") or "\u670d\u52a1\u5668\u62d2\u7edd\u767b\u5f55"
@@ -552,8 +589,21 @@ class App:
         threading.Thread(target=self.sign_worker, args=(username, password, source, source_version), daemon=True, name="RiverNexusSign").start()
 
     def manual_sign(self) -> None:
-        """立即启动一次签到。"""
-        self.launch_sign("手动")
+        """\u7acb\u5373\u7b7e\u5230\uff1b\u5b9a\u65f6\u8fd0\u884c\u671f\u95f4\u540c\u6b65\u63a5\u7ba1\u5f53\u524d\u6392\u7a0b\uff0c\u907f\u514d\u4e0e\u5230\u671f\u4efb\u52a1\u7ade\u4e89\u3002"""
+        if self.scheduler_enabled and not self.signing:
+            try:
+                credentials = self.save_credentials()
+            except Exception as exc:
+                self.logger.error("\u8f93\u5165\u6821\u9a8c\u5931\u8d25\uff1a%s", exc)
+                self.status_var.set("\u8f93\u5165\u9519\u8bef\uff0c\u8bf7\u67e5\u770b\u65e5\u5fd7")
+                return
+            # Invalidate a timer_due event that may already be queued. The manual
+            # run then owns the current schedule and restarts it after completion.
+            self.schedule_version += 1
+            self.logger.info("\u5b9a\u65f6\u8fd0\u884c\u671f\u95f4\u624b\u52a8\u89e6\u53d1\u7b7e\u5230\uff1a\u672c\u6b21\u6267\u884c\u540e\u5c06\u7ee7\u7eed\u5b9a\u65f6\u6392\u7a0b")
+            self.launch_sign("timer", credentials)
+            return
+        self.launch_sign("\u624b\u52a8")
 
     def sign_worker(self, username: str, password: str, source: str, source_version: int | None = None) -> None:
         """\u540e\u53f0\u6267\u884c\u7f51\u7edc\u767b\u5f55/\u7b7e\u5230\u4e0e\u6bcf\u65e5\u8c03\u5ea6\u66f4\u65b0\u3002"""
